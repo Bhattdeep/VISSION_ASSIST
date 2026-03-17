@@ -6,7 +6,7 @@ Vision Assist pipeline. Connects to the Python FastAPI backend via WebSocket.
 ## Project Structure
 
 ```
-vision-assist-ui/
+FRONTEND/
 ├── index.html                      ← Vite entry point
 ├── package.json
 ├── vite.config.js                  ← proxies /ws → ws://localhost:8000
