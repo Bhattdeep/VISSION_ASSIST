@@ -1,0 +1,26 @@
+# AI Vision Assist — Python dependencies
+# Install with:  pip install -r requirements.txt
+#
+# GPU support (optional but recommended):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+
+# Core
+torch>=2.0.0
+torchvision>=0.15.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# Object detection
+ultralytics>=8.0.0          # YOLOv8
+
+# Depth estimation (MiDaS is loaded via torch.hub — no pip package needed)
+timm>=0.9.0                 # backbone dependency for DPT models
+
+# Text-to-speech
+pyttsx3>=2.90
+
+# GUI
+PyQt5>=5.15.0
+
+# Optional: GPU monitoring
+# gputil>=1.4.0
