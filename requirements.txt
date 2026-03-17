@@ -23,4 +23,9 @@ pyttsx3>=2.90
 PyQt5>=5.15.0
 
 # Optional: GPU monitoring
-# gputil>=1.4.0
+gputil>=1.4.0
+
+# Web server (for React UI)
+fastapi>=0.110.0
+uvicorn>=0.27.0
+websockets>=12.0

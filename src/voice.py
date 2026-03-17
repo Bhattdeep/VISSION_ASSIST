@@ -1,25 +1,24 @@
 """
-voice.py — Thread-safe, reliable text-to-speech for Windows + Linux.
+voice.py — Thread-safe, reliable text-to-speech.
 
-Root cause of the "speaks once then goes silent" bug on Windows
----------------------------------------------------------------
-pyttsx3 uses the Windows SAPI5 COM engine under the hood.  Calling
-engine.runAndWait() more than once on the same engine object causes
-the COM event loop to silently stall on many Windows configurations.
-The fix is to create a FRESH pyttsx3 engine for every utterance and
-run it in a short-lived daemon thread.  The overhead is negligible
-(SAPI5 init takes ~10 ms) compared to the several-second cooldown
-between alerts.
+Key behaviours
+--------------
+1. Fresh pyttsx3 engine per utterance — fixes Windows SAPI5 COM stall bug.
 
-Priority levels (lower = higher priority)
-------------------------------------------
-    PRIORITY_CRITICAL = 0   object very close / stop immediately
-    PRIORITY_WARNING  = 1   object nearby / caution
-    PRIORITY_INFO     = 2   general guidance / assistant replies
+2. Queue flood prevention:
+   - While speaking, NEW messages of same or lower priority are DISCARDED.
+     (The pipeline fires every alert_delay seconds; if speech takes longer
+      than alert_delay, without this guard the queue fills with stale
+      messages and speech never stops.)
+   - CRITICAL messages always preempt — queue is cleared and new message
+     jumps to front.
+
+3. Deduplication: if the exact same text is already waiting in the queue,
+   it is not added again.
 """
 
 import threading
-import queue
+import queue as _queue
 
 PRIORITY_CRITICAL = 0
 PRIORITY_WARNING  = 1
@@ -27,10 +26,7 @@ PRIORITY_INFO     = 2
 
 
 def _speak_once(text: str, rate: int, volume: float):
-    """
-    Speak one utterance using a brand-new pyttsx3 engine.
-    Runs in its own thread — safe to call from any thread.
-    """
+    """Speak one utterance with a fresh engine (thread-safe on Windows)."""
     try:
         import pyttsx3
         engine = pyttsx3.init()
@@ -45,101 +41,86 @@ def _speak_once(text: str, rate: int, volume: float):
 
 class VoiceEngine:
     """
-    Queues speech messages and plays them one at a time on a
-    dedicated worker thread.  Each utterance gets a fresh pyttsx3
-    engine to avoid the Windows COM stall bug.
-
-    Usage
-    -----
-        ve = VoiceEngine(rate=185)
-        ve.start()
-        ve.speak("Obstacle ahead.", priority=PRIORITY_WARNING)
-        ve.stop()
+    Priority queue TTS engine.  Each utterance runs in its own thread
+    so the Windows COM event loop never stalls.
     """
 
     def __init__(self, rate: int = 185, volume: float = 1.0):
         self.rate     = rate
         self.volume   = volume
 
-        self._queue   = queue.Queue(maxsize=6)
-        self._thread  = threading.Thread(target=self._worker, daemon=True)
-        self._running = False
-        self._busy    = False          # True while an utterance is playing
-
-    # ── public API ──────────────────────────────────────────────────
+        self._queue        = _queue.PriorityQueue(maxsize=4)
+        self._thread       = threading.Thread(target=self._worker, daemon=True)
+        self._running      = False
+        self._busy         = False
+        self._current_pri  = PRIORITY_INFO   # priority of what is currently speaking
 
     def start(self):
         self._running = True
         self._thread.start()
 
     def speak(self, text: str, priority: int = PRIORITY_WARNING):
-        """
-        Enqueue text for speech.
-
-        Dropping rules (to avoid a massive backlog of stale alerts):
-          - If the engine is busy speaking a CRITICAL message, drop everything.
-          - If the engine is busy speaking a WARNING/INFO, drop INFO only.
-          - If the queue is full, drop the new message (oldest stays).
-        """
         if not self._running:
             return
 
-        # Never enqueue duplicates of whatever is already pending
+        # ── flood guard ──────────────────────────────────────────────
+        # If we are currently speaking something of equal or higher
+        # priority (lower number), discard this new message entirely.
+        # CRITICAL always goes through.
+        if self._busy and priority > PRIORITY_CRITICAL:
+            if priority >= self._current_pri:
+                return   # discard — currently speaking same/higher priority
+
+        # ── deduplication ────────────────────────────────────────────
+        # Peek at queue contents; skip if identical text is already waiting
+        with self._queue.mutex:
+            for _, queued_text in list(self._queue.queue):
+                if queued_text == text:
+                    return
+
+        # ── critical preemption ──────────────────────────────────────
+        if priority == PRIORITY_CRITICAL:
+            # Drain lower-priority items to make room
+            with self._queue.mutex:
+                self._queue.queue = [
+                    item for item in self._queue.queue
+                    if item[0] == PRIORITY_CRITICAL
+                ]
+
         try:
             self._queue.put_nowait((priority, text))
-        except queue.Full:
-            # Queue full — try to make room by discarding lowest-priority item
-            try:
-                # Drain and re-add only higher-priority items
-                items = []
-                while True:
-                    items.append(self._queue.get_nowait())
-            except queue.Empty:
-                pass
-
-            # Keep items that are higher priority than the new message
-            kept = [i for i in items if i[0] <= priority]
-            # Add the new message
-            kept.append((priority, text))
-            # Sort by priority and re-queue up to maxsize
-            kept.sort(key=lambda x: x[0])
-            for item in kept[:6]:
-                try:
-                    self._queue.put_nowait(item)
-                except queue.Full:
-                    break
+        except _queue.Full:
+            pass   # queue saturated; drop gracefully
 
     def stop(self):
         self._running = False
         try:
-            self._queue.put_nowait((-1, None))   # sentinel
-        except queue.Full:
+            self._queue.put_nowait((-1, None))
+        except _queue.Full:
             pass
 
     def is_speaking(self) -> bool:
         return self._busy
 
-    # ── worker ──────────────────────────────────────────────────────
-
     def _worker(self):
         while self._running:
             try:
                 priority, text = self._queue.get(timeout=0.3)
-            except queue.Empty:
+            except _queue.Empty:
                 continue
 
-            if text is None:    # stop sentinel
+            if text is None:
                 break
 
-            self._busy = True
+            self._busy        = True
+            self._current_pri = priority
             try:
-                # Fresh engine per utterance — fixes Windows COM stall
                 t = threading.Thread(
                     target=_speak_once,
                     args=(text, self.rate, self.volume),
                     daemon=True,
                 )
                 t.start()
-                t.join(timeout=15)   # hard timeout so we never block forever
+                t.join(timeout=15)
             finally:
                 self._busy = False
