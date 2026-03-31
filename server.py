@@ -14,7 +14,7 @@ Architecture
 Messages  SERVER → CLIENT (JSON)
 ---------------------------------
     {"type":"frame",      "data":"<base64-jpeg>"}
-    {"type":"detections", "data":[{"name":"person","conf":0.92,"depth":0.78,"pos":"left"},...]}
+    {"type":"detections", "data":[{"name":"person","conf":0.92,"depth":0.78,"distance_cm":95.0,"pos":"left"},...]}
     {"type":"alert",      "message":"Warning! Person ahead.","urgency":"critical"}
     {"type":"stats",      "fps":18.3,"device":"GPU (CUDA)","depth_ready":true,"mode":"upgraded","sensor_on":false}
     {"type":"distance",   "cm":84.2,"zone":"warning"}
@@ -30,7 +30,7 @@ Messages  CLIENT → SERVER (JSON)
     {"type":"stop"}
     {"type":"settings","confidence":0.65,"alert_delay":1.2}
     {"type":"depth_overlay","enabled":true}
-    {"type":"ask","question":"What is ahead?","api_key":"sk-ant-..."}
+    {"type":"ask","question":"What is ahead?","api_key":"AIza..."}
 
 Run
 ---
@@ -73,6 +73,9 @@ class Pipeline:
         self._loop       : Optional[asyncio.AbstractEventLoop] = None
         self.voice       = None
         self._last_alert = 0.0   # initialised here so reset_alert_timer() is always safe
+        self._last_detections = []
+        self._last_distance_cm = None
+        self._depth_ready = False
 
     def start(self, config: dict, loop: asyncio.AbstractEventLoop):
         if self._running:
@@ -85,6 +88,9 @@ class Pipeline:
 
     def stop(self):
         self._running = False
+        self._last_detections = []
+        self._last_distance_cm = None
+        self._depth_ready = False
         if self.voice:
             try: self.voice.stop()
             except: pass
@@ -112,6 +118,7 @@ class Pipeline:
         from detection  import ObjectDetector
         from navigation import Navigator
         from voice      import VoiceEngine, PRIORITY_CRITICAL, PRIORITY_WARNING, PRIORITY_INFO
+        from alerts     import AlertSuppressor
 
         device       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         device_label = "GPU (CUDA)" if device.type == "cuda" else "CPU"
@@ -172,6 +179,9 @@ class Pipeline:
             return
 
         self._last_alert = 0.0   # reset at start of each run
+        alert_guard = AlertSuppressor(
+            min_repeat_gap_sec=max(6.0, self._config.get("alert_delay", 1.5) * 3.0)
+        )
         self._push({"type":"status","running":True})
 
         fps_buf = deque(maxlen=20)
@@ -193,10 +203,12 @@ class Pipeline:
 
             # Depth
             depth_map = depth_est.update(frame) if depth_est else None
+            self._depth_ready = depth_est.ever_ready if depth_est else False
 
             # Detection
             detector.confidence = self._config.get("confidence", 0.60)
             detections = detector.detect(frame)
+            self._last_detections = detections
 
             # Navigation
             if depth_map is not None:
@@ -206,6 +218,7 @@ class Pipeline:
 
             # Sonar
             dist_cm = sensor.distance_cm if sensor else None
+            self._last_distance_cm = dist_cm
             if dist_cm is not None:
                 from ultrasonic import ZONE_DANGER, ZONE_WARNING
                 zone = ("danger" if dist_cm < ZONE_DANGER
@@ -216,7 +229,10 @@ class Pipeline:
                 if dist_cm < 50 and advice is None:
                     msg = f"Object {dist_cm:.0f} cm ahead. Stop immediately."
                     t_cur = time.time()
-                    if (t_cur - self._last_alert) > self._config.get("alert_delay", 1.5):
+                    if (
+                        (t_cur - self._last_alert) > self._config.get("alert_delay", 1.5)
+                        and alert_guard.should_emit("sonar:critical", "critical", dist_cm, t_cur)
+                    ):
                         if self._config.get("voice_enabled", True):
                             self.voice.speak(msg, priority=PRIORITY_CRITICAL)
                         self._push({"type":"alert","message":msg,"urgency":"critical"})
@@ -224,7 +240,16 @@ class Pipeline:
 
             # Alert
             t_cur = time.time()
-            if advice and (t_cur - self._last_alert) > self._config.get("alert_delay", 1.5):
+            if (
+                advice
+                and (t_cur - self._last_alert) > self._config.get("alert_delay", 1.5)
+                and alert_guard.should_emit(
+                    advice.fingerprint,
+                    advice.urgency,
+                    advice.distance_cm,
+                    t_cur,
+                )
+            ):
                 if self._config.get("voice_enabled", True):
                     self.voice.speak(advice.message,
                                      priority=PMAP.get(advice.urgency, PRIORITY_WARNING))
@@ -250,6 +275,7 @@ class Pipeline:
                     "name": d.class_name, "conf": round(d.confidence, 2),
                     "depth": round(dv, 2), "pos": navigator._horizontal_zone(d.center_x),
                     "area": d.area,
+                    "distance_cm": round(d.estimated_distance_cm, 1) if d.estimated_distance_cm is not None else None,
                 })
             self._push({"type":"detections","data":det_list})
 
@@ -276,16 +302,25 @@ class Pipeline:
             disp = cv2.addWeighted(disp, 0.55, heat, 0.45, 0)
 
         for det in detections:
+            est_cm = getattr(det, "estimated_distance_cm", None)
             dv = 0.0
             if depth_map is not None:
                 from navigation import Navigator as _N
                 dv = _N._sample_depth(depth_map, det.center_x, det.center_y)
-            col = ((60,60,255) if dv >= ZONE_VERY_CLOSE
-                   else (40,160,255) if dv >= ZONE_CLOSE
-                   else (60,220,100))
+            if est_cm is not None:
+                col = ((60,60,255) if est_cm <= 120
+                       else (40,160,255) if est_cm <= 220
+                       else (60,220,100))
+            else:
+                col = ((60,60,255) if dv >= ZONE_VERY_CLOSE
+                       else (40,160,255) if dv >= ZONE_CLOSE
+                       else (60,220,100))
             cv2.rectangle(disp, (det.x1,det.y1),(det.x2,det.y2), col, 2)
             lbl = f"{det.class_name} {det.confidence:.0%}"
-            if depth_map is not None: lbl += f" {dv:.2f}"
+            if est_cm is not None:
+                lbl += f" ~{est_cm:.0f}cm"
+            elif depth_map is not None:
+                lbl += f" rel={dv:.2f}"
             (tw,th),_ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
             cv2.rectangle(disp,(det.x1,det.y1-th-8),(det.x1+tw+6,det.y1),col,-1)
             cv2.putText(disp,lbl,(det.x1+3,det.y1-4),
@@ -364,20 +399,15 @@ async def websocket_endpoint(ws: WebSocket):
                 # Run AI call in thread to not block event loop
                 async def ask_ai():
                     try:
-                        import anthropic
-                        client = anthropic.Anthropic(api_key=api_key)
-                        # Build scene context from latest state
-                        response = client.messages.create(
-                            model="claude-sonnet-4-20250514",
-                            max_tokens=300,
-                            system=(
-                                "You are a helpful AI assistant in a wearable vision system "
-                                "for visually impaired users. Give brief, clear spoken responses "
-                                "(1-3 sentences, no markdown). Always prioritise safety."
-                            ),
-                            messages=[{"role":"user","content":question}]
+                        from assistant_llm import ask_free_llm
+                        answer = await asyncio.to_thread(
+                            ask_free_llm,
+                            question=question,
+                            api_key=api_key,
+                            detections=list(pipeline._last_detections),
+                            distance_cm=pipeline._last_distance_cm,
+                            depth_ready=pipeline._depth_ready,
                         )
-                        answer = response.content[0].text.strip()
                         await ws.send_text(json.dumps({"type":"assistant","answer":answer}))
                         if pipeline.voice and pipeline._config.get("voice_enabled", True):
                             from voice import PRIORITY_INFO

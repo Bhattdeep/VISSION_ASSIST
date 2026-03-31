@@ -1,3 +1,6 @@
 env/
 models/
 FRONTEND/node_modules
+__pycache__/
+*.pyc
+FRONTEND/dist/

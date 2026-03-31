@@ -7,13 +7,20 @@ const POS_COLORS = {
 }
 
 function DetectionRow({ det, index }) {
-  const depthPct = det.depth > 0
-    ? Math.round(det.depth * 100)
-    : Math.min(100, Math.round((det.area || 0) / 1200))
+  const distanceCm = typeof det.distance_cm === 'number' ? det.distance_cm : null
+  const depthPct = distanceCm != null
+    ? Math.max(0, Math.min(100, Math.round(100 - Math.min(distanceCm, 400) / 4)))
+    : det.depth > 0
+      ? Math.round(det.depth * 100)
+      : Math.min(100, Math.round((det.area || 0) / 1200))
 
   const clamped = Math.min(100, Math.max(0, depthPct))
 
-  const barColor = clamped >= 70 ? '#FF2D55'
+  const barColor = distanceCm != null
+                 ? distanceCm <= 120 ? '#FF2D55'
+                   : distanceCm <= 220 ? '#FFB300'
+                   : '#00FF88'
+                 : clamped >= 70 ? '#FF2D55'
                  : clamped >= 50 ? '#FFB300'
                  : '#00FF88'
 
@@ -50,10 +57,10 @@ function DetectionRow({ det, index }) {
 
       {/* Depth value */}
       <div
-        className="font-mono text-[10px] w-8 text-right flex-shrink-0"
+        className="font-mono text-[10px] w-14 text-right flex-shrink-0"
         style={{ color: barColor }}
       >
-        {det.depth > 0 ? det.depth.toFixed(2) : '---'}
+        {distanceCm != null ? `${Math.round(distanceCm)}cm` : det.depth > 0 ? det.depth.toFixed(2) : '---'}
       </div>
 
       {/* Position */}

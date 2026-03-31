@@ -32,16 +32,167 @@ export default function AssistantPanel({ onAsk, messages, busy }) {
   const [question, setQuestion] = useState('')
   const [apiKey,   setApiKey]   = useState('')
   const [showKey,  setShowKey]  = useState(false)
+  const [listening, setListening] = useState(false)
+  const [speechState, setSpeechState] = useState('')
+  const [handsFree, setHandsFree] = useState(false)
   const chatEndRef = useRef(null)
+  const recognitionRef = useRef(null)
+  const onAskRef = useRef(onAsk)
+  const apiKeyRef = useRef(apiKey)
+  const busyRef = useRef(busy)
+  const autoListenTimerRef = useRef(null)
+  const lastAutoReplyRef = useRef(null)
+  const RecognitionCtor = typeof window !== 'undefined'
+    ? (window.SpeechRecognition || window.webkitSpeechRecognition || null)
+    : null
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, busy])
 
+  useEffect(() => {
+    onAskRef.current = onAsk
+  }, [onAsk])
+
+  useEffect(() => {
+    apiKeyRef.current = apiKey
+  }, [apiKey])
+
+  useEffect(() => {
+    busyRef.current = busy
+  }, [busy])
+
+  useEffect(() => () => {
+    if (autoListenTimerRef.current) {
+      clearTimeout(autoListenTimerRef.current)
+      autoListenTimerRef.current = null
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!RecognitionCtor) return undefined
+
+    const recognition = new RecognitionCtor()
+    recognition.lang = 'en-US'
+    recognition.interimResults = true
+    recognition.maxAlternatives = 1
+
+    recognition.onstart = () => {
+      setListening(true)
+      setSpeechState('Listening… speak your question now.')
+    }
+
+    recognition.onresult = (event) => {
+      let transcript = ''
+      for (let i = event.resultIndex; i < event.results.length; i += 1) {
+        transcript += event.results[i][0].transcript
+      }
+      setQuestion(transcript.trim())
+
+      const lastResult = event.results[event.results.length - 1]
+      if (lastResult?.isFinal) {
+        const finalText = transcript.trim()
+        if (finalText && !busyRef.current) {
+          setSpeechState(`Heard: "${finalText}"`)
+          onAskRef.current(finalText, apiKeyRef.current.trim())
+          setQuestion('')
+        }
+      }
+    }
+
+    recognition.onerror = (event) => {
+      setListening(false)
+      setSpeechState(`Microphone error: ${event.error}`)
+    }
+
+    recognition.onend = () => {
+      setListening(false)
+      setSpeechState((prev) => prev || 'Ready for voice input.')
+    }
+
+    recognitionRef.current = recognition
+    return () => {
+      recognitionRef.current?.stop()
+      recognitionRef.current = null
+    }
+  }, [RecognitionCtor])
+
+  useEffect(() => {
+    if (!handsFree || listening || busy || !RecognitionCtor) return
+    if (messages.length === 0) return
+
+    const lastMsg = messages[messages.length - 1]
+    if (!lastMsg || (lastMsg.role !== 'ai' && lastMsg.role !== 'error')) return
+
+    const key = `${messages.length}:${lastMsg.role}:${lastMsg.text}`
+    if (lastAutoReplyRef.current === key) return
+    lastAutoReplyRef.current = key
+
+    if (autoListenTimerRef.current) {
+      clearTimeout(autoListenTimerRef.current)
+    }
+    autoListenTimerRef.current = setTimeout(() => {
+      if (!busyRef.current && !listening) {
+        try {
+          recognitionRef.current?.start()
+        } catch (err) {
+          setSpeechState('Could not restart voice input automatically. Press MIC to continue.')
+        }
+      }
+    }, 1400)
+  }, [messages, handsFree, listening, busy, RecognitionCtor])
+
+  useEffect(() => {
+    if (!handsFree || listening || busy || !RecognitionCtor) return
+    if (messages.length !== 0) return
+
+    setSpeechState('Hands-free mode on. Listening will start automatically.')
+    if (autoListenTimerRef.current) {
+      clearTimeout(autoListenTimerRef.current)
+    }
+    autoListenTimerRef.current = setTimeout(() => {
+      if (!busyRef.current && !listening) {
+        try {
+          recognitionRef.current?.start()
+        } catch (err) {
+          setSpeechState('Press MIC to begin voice input.')
+        }
+      }
+    }, 800)
+  }, [handsFree, listening, busy, RecognitionCtor, messages.length])
+
+  useEffect(() => {
+    if (handsFree) return
+    if (autoListenTimerRef.current) {
+      clearTimeout(autoListenTimerRef.current)
+      autoListenTimerRef.current = null
+    }
+  }, [handsFree])
+
   const handleSend = () => {
-    if (!question.trim() || !apiKey.trim() || busy) return
+    if (!question.trim() || busy) return
     onAsk(question.trim(), apiKey.trim())
     setQuestion('')
+  }
+
+  const handleMic = () => {
+    if (!RecognitionCtor) {
+      setSpeechState('Browser speech recognition is not available here. Use Chrome or Edge.')
+      return
+    }
+    if (busy) return
+
+    if (listening) {
+      recognitionRef.current?.stop()
+      return
+    }
+
+    setSpeechState('')
+    if (autoListenTimerRef.current) {
+      clearTimeout(autoListenTimerRef.current)
+      autoListenTimerRef.current = null
+    }
+    recognitionRef.current?.start()
   }
 
   const suggestions = [
@@ -60,7 +211,7 @@ export default function AssistantPanel({ onAsk, messages, busy }) {
         <input
           type={showKey ? 'text' : 'password'}
           className="hud-input flex-1 text-[10px]"
-          placeholder="Anthropic API key  sk-ant-..."
+          placeholder="Gemini API key from Google AI Studio (optional if set on server)"
           value={apiKey}
           onChange={(e) => setApiKey(e.target.value)}
         />
@@ -70,6 +221,24 @@ export default function AssistantPanel({ onAsk, messages, busy }) {
         >
           {showKey ? 'HIDE' : 'SHOW'}
         </button>
+      </div>
+      <div className="px-3 pb-2 font-mono text-[8px] text-txt3 border-b border-border">
+        Uses Gemini free-tier friendly requests. You can paste a key here or set `GEMINI_API_KEY` on the server.
+      </div>
+      <div className="px-3 py-2 font-mono text-[8px] text-txt3 border-b border-border">
+        {speechState || (RecognitionCtor ? 'Press MIC to ask by voice.' : 'Voice input is available in browsers with the Web Speech API.')}
+      </div>
+      <div className="px-3 py-2 border-b border-border">
+        <label className="flex items-center gap-2 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={handsFree}
+            onChange={(e) => setHandsFree(e.target.checked)}
+          />
+          <span className="font-mono text-[9px] text-txt2">
+            Hands-free follow-up mode
+          </span>
+        </label>
       </div>
 
       {/* Chat log */}
@@ -132,10 +301,19 @@ export default function AssistantPanel({ onAsk, messages, busy }) {
           onKeyDown={(e) => e.key === 'Enter' && handleSend()}
         />
         <button
+          className={`hud-btn text-[9px] px-3 whitespace-nowrap ${
+            listening ? 'hud-btn-cyan' : 'hud-btn-cyan'
+          } disabled:opacity-40 disabled:cursor-not-allowed`}
+          onClick={handleMic}
+          disabled={busy}
+        >
+          {listening ? 'STOP' : 'MIC'}
+        </button>
+        <button
           className="hud-btn hud-btn-cyan text-[9px] px-3 whitespace-nowrap
                      disabled:opacity-40 disabled:cursor-not-allowed"
           onClick={handleSend}
-          disabled={busy || !question.trim() || !apiKey.trim()}
+          disabled={busy || !question.trim()}
         >
           ASK
         </button>

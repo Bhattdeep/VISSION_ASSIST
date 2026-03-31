@@ -34,6 +34,7 @@ from typing import List, Optional
 
 import numpy as np
 from detection import Detection
+from ranging import DistanceEstimator, DistanceSmoother
 
 
 # ── Fixed fallback thresholds (used when no depth map available) ─────
@@ -46,6 +47,11 @@ AREA_CRITICAL = 80_000
 AREA_WARNING  = 25_000
 AREA_INFO     = 10_000
 
+# Approximate distance thresholds for monocular camera ranging
+DISTANCE_CRITICAL_CM = 120.0
+DISTANCE_WARNING_CM  = 220.0
+DISTANCE_INFO_CM     = 400.0
+
 
 @dataclass
 class NavigationAdvice:
@@ -54,6 +60,8 @@ class NavigationAdvice:
     h_position  : str       # "left" | "center" | "right"
     urgency     : str       # "critical" | "warning" | "info"
     message     : str
+    distance_cm : Optional[float] = None
+    fingerprint : str = ""
 
 
 class Navigator:
@@ -61,6 +69,11 @@ class Navigator:
     def __init__(self, frame_width: int = 640, frame_height: int = 480):
         self.frame_width  = frame_width
         self.frame_height = frame_height
+        self.distance_estimator = DistanceEstimator(
+            frame_width=frame_width,
+            frame_height=frame_height,
+        )
+        self.distance_smoother = DistanceSmoother()
 
     # ── depth-aware analysis (upgraded mode) ────────────────────────
     def analyse(
@@ -90,13 +103,28 @@ class Navigator:
         for det in detections:
             dv = self._sample_depth(depth_map, det.center_x, det.center_y)
 
-            # Skip objects that are far away
-            if dv < p45:
-                continue
-
             h_pos   = self._horizontal_zone(det.center_x)
-            urgency = self._urgency_depth(dv, p70, p90)
-            msg     = self._compose_message(det.class_name, h_pos, urgency)
+            det.h_position = h_pos
+            distance_cm = self._estimate_distance_cm(
+                det,
+                h_pos,
+                depth_value=dv,
+                p_far=p45,
+                p_mid=p70,
+                p_near=p90,
+            )
+            det.estimated_distance_cm = distance_cm
+            if distance_cm is not None:
+                urgency = self._urgency_distance(distance_cm)
+                if urgency is None:
+                    continue
+            else:
+                # Skip objects that are far away when only relative depth is available
+                if dv < p45:
+                    continue
+                urgency = self._urgency_depth(dv, p70, p90)
+            det.urgency = urgency
+            msg = self._compose_message(det.class_name, h_pos, urgency, distance_cm)
 
             advice = NavigationAdvice(
                 object_name = det.class_name,
@@ -104,9 +132,11 @@ class Navigator:
                 h_position  = h_pos,
                 urgency     = urgency,
                 message     = msg,
+                distance_cm = distance_cm,
+                fingerprint = self._fingerprint(det.class_name, h_pos, urgency),
             )
 
-            if best is None or self._priority(advice) < self._priority(best):
+            if best is None or self._sort_key(advice) < self._sort_key(best):
                 best = advice
             elif self._priority(advice) == self._priority(best) and dv > best.depth_value:
                 best = advice
@@ -123,12 +153,20 @@ class Navigator:
         best: Optional[NavigationAdvice] = None
 
         for det in detections:
-            if det.area < min_area:
-                continue
-
             h_pos   = self._horizontal_zone(det.center_x)
-            urgency = self._urgency_area(det.area)
-            msg     = self._compose_message(det.class_name, h_pos, urgency)
+            det.h_position = h_pos
+            distance_cm = self._estimate_distance_cm(det, h_pos)
+            det.estimated_distance_cm = distance_cm
+            if distance_cm is not None:
+                urgency = self._urgency_distance(distance_cm)
+                if urgency is None:
+                    continue
+            else:
+                if det.area < min_area:
+                    continue
+                urgency = self._urgency_area(det.area)
+            det.urgency = urgency
+            msg = self._compose_message(det.class_name, h_pos, urgency, distance_cm)
 
             advice = NavigationAdvice(
                 object_name = det.class_name,
@@ -136,9 +174,11 @@ class Navigator:
                 h_position  = h_pos,
                 urgency     = urgency,
                 message     = msg,
+                distance_cm = distance_cm,
+                fingerprint = self._fingerprint(det.class_name, h_pos, urgency),
             )
 
-            if best is None or self._priority(advice) < self._priority(best):
+            if best is None or self._sort_key(advice) < self._sort_key(best):
                 best = advice
             elif self._priority(advice) == self._priority(best) and det.area > best.depth_value:
                 best = advice
@@ -172,9 +212,24 @@ class Navigator:
             return "warning"
         return "info"
 
+    @staticmethod
+    def _urgency_distance(distance_cm: float) -> Optional[str]:
+        if distance_cm <= DISTANCE_CRITICAL_CM:
+            return "critical"
+        if distance_cm <= DISTANCE_WARNING_CM:
+            return "warning"
+        if distance_cm <= DISTANCE_INFO_CM:
+            return "info"
+        return None
+
     # ── message composition ─────────────────────────────────────────
     @staticmethod
-    def _compose_message(name: str, position: str, urgency: str) -> str:
+    def _compose_message(
+        name: str,
+        position: str,
+        urgency: str,
+        distance_cm: Optional[float] = None,
+    ) -> str:
         n = name.capitalize()
 
         if position == "center":
@@ -187,17 +242,61 @@ class Navigator:
             location = "on your right"
             action   = "Move left."
 
+        if distance_cm is not None:
+            rounded = DistanceEstimator.rounded_cm(distance_cm, step=10)
+            distance_phrase = f" about {rounded} centimeters away"
+        else:
+            distance_phrase = ""
+
         if urgency == "critical":
+            if distance_phrase:
+                return f"Warning! {n}{distance_phrase} {location}. {action}"
             return f"Warning! {n} very close {location}. {action}"
         elif urgency == "warning":
+            if distance_phrase:
+                return f"{n}{distance_phrase} {location}. {action}"
             return f"{n} {location}. {action}"
         else:
+            if distance_phrase:
+                return f"{n}{distance_phrase} {location}. {action}"
             return f"{n} nearby {location}. {action}"
 
     # ── priority ────────────────────────────────────────────────────
     @staticmethod
     def _priority(advice: NavigationAdvice) -> int:
         return {"critical": 0, "warning": 1, "info": 2}.get(advice.urgency, 3)
+
+    @classmethod
+    def _sort_key(cls, advice: NavigationAdvice):
+        secondary = advice.distance_cm if advice.distance_cm is not None else -advice.depth_value
+        return (cls._priority(advice), secondary)
+
+    @staticmethod
+    def _fingerprint(name: str, position: str, urgency: str) -> str:
+        return f"{name.lower()}:{position}:{urgency}"
+
+    def _estimate_distance_cm(
+        self,
+        det: Detection,
+        h_pos: str,
+        depth_value: Optional[float] = None,
+        p_far: Optional[float] = None,
+        p_mid: Optional[float] = None,
+        p_near: Optional[float] = None,
+    ) -> Optional[float]:
+        raw_cm = self.distance_estimator.estimate_detection_cm(det)
+        raw_cm = self.distance_estimator.apply_depth_hint(
+            raw_cm,
+            depth_value,
+            p_far,
+            p_mid,
+            p_near,
+        )
+        if raw_cm is None:
+            return None
+
+        key = self.distance_estimator.track_key(det, h_pos)
+        return self.distance_smoother.update(key, raw_cm)
 
     # ── depth sampler ───────────────────────────────────────────────
     @staticmethod

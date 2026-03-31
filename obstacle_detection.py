@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 from detection  import ObjectDetector
 from navigation import Navigator
 from voice      import VoiceEngine, PRIORITY_WARNING, PRIORITY_CRITICAL
+from alerts     import AlertSuppressor
 
 
 # ─────────────────────────────────────────────
@@ -56,6 +57,7 @@ def main():
     # ── Model & Navigator ───────────────────
     detector  = ObjectDetector(model_path=MODEL_PATH, confidence=CONFIDENCE)
     navigator = Navigator(frame_width=FRAME_WIDTH, frame_height=FRAME_HEIGHT)
+    alert_guard = AlertSuppressor(min_repeat_gap_sec=max(6.0, ALERT_DELAY * 2.0))
 
     last_alert_time = 0.0
 
@@ -74,20 +76,35 @@ def main():
         # ── Detection ───────────────────────
         detections = detector.detect(frame)
 
-        # Draw bounding boxes
-        for det in detections:
-            cv2.rectangle(frame, (det.x1, det.y1), (det.x2, det.y2), (0, 255, 0), 2)
-            label = f"{det.class_name} {det.confidence:.0%}"
-            cv2.putText(
-                frame, label, (det.x1, det.y1 - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1
-            )
-
         # ── Navigation ──────────────────────
         advice = navigator.analyse_by_area(detections, min_area=MIN_AREA)
 
+        # Draw bounding boxes
+        for det in detections:
+            est_cm = getattr(det, "estimated_distance_cm", None)
+            colour = (0, 0, 255) if est_cm is not None and est_cm <= 120 else (
+                (0, 165, 255) if est_cm is not None and est_cm <= 220 else (0, 255, 0)
+            )
+            cv2.rectangle(frame, (det.x1, det.y1), (det.x2, det.y2), colour, 2)
+            label = f"{det.class_name} {det.confidence:.0%}"
+            if est_cm is not None:
+                label += f" ~{est_cm:.0f}cm"
+            cv2.putText(
+                frame, label, (det.x1, det.y1 - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, colour, 1
+            )
+
         current_time = time.time()
-        if advice and (current_time - last_alert_time) > ALERT_DELAY:
+        if (
+            advice
+            and (current_time - last_alert_time) > ALERT_DELAY
+            and alert_guard.should_emit(
+                advice.fingerprint,
+                advice.urgency,
+                advice.distance_cm,
+                current_time,
+            )
+        ):
             priority = (
                 PRIORITY_CRITICAL if advice.urgency == "critical"
                 else PRIORITY_WARNING

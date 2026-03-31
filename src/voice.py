@@ -19,6 +19,7 @@ Key behaviours
 
 import threading
 import queue as _queue
+import time
 
 PRIORITY_CRITICAL = 0
 PRIORITY_WARNING  = 1
@@ -54,6 +55,8 @@ class VoiceEngine:
         self._running      = False
         self._busy         = False
         self._current_pri  = PRIORITY_INFO   # priority of what is currently speaking
+        self._recent_texts = {}
+        self._dedupe_window_sec = 8.0
 
     def start(self):
         self._running = True
@@ -61,6 +64,14 @@ class VoiceEngine:
 
     def speak(self, text: str, priority: int = PRIORITY_WARNING):
         if not self._running:
+            return
+
+        now = time.time()
+        self._recent_texts = {
+            msg: ts for msg, ts in self._recent_texts.items()
+            if (now - ts) < self._dedupe_window_sec
+        }
+        if text in self._recent_texts:
             return
 
         # ── flood guard ──────────────────────────────────────────────
@@ -89,6 +100,7 @@ class VoiceEngine:
 
         try:
             self._queue.put_nowait((priority, text))
+            self._recent_texts[text] = now
         except _queue.Full:
             pass   # queue saturated; drop gracefully
 

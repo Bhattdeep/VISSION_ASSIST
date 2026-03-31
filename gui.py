@@ -88,49 +88,33 @@ class AssistantWorker(QThread):
 
     def run(self):
         try:
-            import anthropic
-        except ImportError:
-            self.error_occurred.emit(
-                "anthropic package not installed.\nRun:  pip install anthropic"
+            from assistant_llm import ask_free_llm
+            answer = ask_free_llm(
+                question=self.question,
+                api_key=self.api_key,
+                detections=self.detections,
+                distance_cm=self.distance_cm,
+                depth_ready=self.depth_ready,
+                history=self.history,
             )
-            return
+            self.response_ready.emit(answer)
+        except Exception as exc:
+            self.error_occurred.emit(str(exc))
 
-        # Build scene description
-        parts = []
-        if self.distance_cm is not None:
-            ft = self.distance_cm / 30.48
-            parts.append(f"Ultrasonic sensor: nearest object is {self.distance_cm:.0f} cm ({ft:.1f} ft) away.")
-        else:
-            parts.append("Ultrasonic sensor: not connected or no reading.")
 
-        if self.detections:
-            names = [f"{d.class_name} ({d.confidence:.0%})" for d in self.detections[:5]]
-            parts.append(f"Camera detections: {', '.join(names)}.")
-        else:
-            parts.append("Camera detections: no objects detected.")
+class SpeechInputWorker(QThread):
+    transcript_ready = pyqtSignal(str)
+    error_occurred   = pyqtSignal(str)
 
-        parts.append(f"Depth estimation: {'active' if self.depth_ready else 'not active'}.")
-        scene = " ".join(parts)
+    def __init__(self, timeout_sec: int = 6):
+        super().__init__()
+        self.timeout_sec = timeout_sec
 
-        system = (
-            "You are a helpful AI assistant embedded in a wearable vision system for "
-            "visually impaired users. Answer questions about the user's environment using "
-            "the scene context provided, or answer general questions. Keep responses "
-            "brief (1-3 sentences), plain text, no markdown. Prioritise safety.\n\n"
-            f"=== CURRENT SCENE ===\n{scene}\n=== END SCENE ==="
-        )
-
-        messages = self.history[-10:] + [{"role": "user", "content": self.question}]
-
+    def run(self):
         try:
-            client   = anthropic.Anthropic(api_key=self.api_key)
-            response = client.messages.create(
-                model      = "claude-sonnet-4-20250514",
-                max_tokens = 300,
-                system     = system,
-                messages   = messages,
-            )
-            self.response_ready.emit(response.content[0].text.strip())
+            from speech_input import capture_speech_text
+            text = capture_speech_text(timeout_sec=self.timeout_sec)
+            self.transcript_ready.emit(text)
         except Exception as exc:
             self.error_occurred.emit(str(exc))
 
@@ -171,6 +155,7 @@ class PipelineWorker(QThread):
             from detection  import ObjectDetector
             from navigation import Navigator
             from voice      import VoiceEngine, PRIORITY_CRITICAL, PRIORITY_WARNING, PRIORITY_INFO
+            from alerts     import AlertSuppressor
         except Exception as exc:
             self.startup_error.emit(f"Could not load src modules:\n\n{exc}")
             return
@@ -234,6 +219,9 @@ class PipelineWorker(QThread):
             return
 
         self._last_alert = 0.0
+        alert_guard = AlertSuppressor(
+            min_repeat_gap_sec=max(6.0, self.config.get("alert_delay", 1.5) * 3.0)
+        )
         fps_buf    = deque(maxlen=20)
         t_prev     = time.time()
 
@@ -270,14 +258,26 @@ class PipelineWorker(QThread):
                     from voice import PRIORITY_CRITICAL as PC
                     msg = f"Object {dist_cm:.0f} cm ahead. Stop immediately."
                     t_cur = time.time()
-                    if (t_cur - self._last_alert) > self.config.get("alert_delay", 1.5):
+                    if (
+                        (t_cur - self._last_alert) > self.config.get("alert_delay", 1.5)
+                        and alert_guard.should_emit("sonar:critical", "critical", dist_cm, t_cur)
+                    ):
                         if self.config.get("voice_enabled", True):
                             self.voice.speak(msg, priority=PC)
                         self.alert_triggered.emit(msg, "critical")
                         self._last_alert = t_cur
 
             t_cur = time.time()
-            if advice and (t_cur - self._last_alert) > self.config.get("alert_delay", 1.5):
+            if (
+                advice
+                and (t_cur - self._last_alert) > self.config.get("alert_delay", 1.5)
+                and alert_guard.should_emit(
+                    advice.fingerprint,
+                    advice.urgency,
+                    advice.distance_cm,
+                    t_cur,
+                )
+            ):
                 if self.config.get("voice_enabled", True):
                     pmap = {"critical": PRIORITY_CRITICAL,
                             "warning" : PRIORITY_WARNING,
@@ -312,14 +312,23 @@ class PipelineWorker(QThread):
             disp = cv2.addWeighted(disp, 0.55, heat, 0.45, 0)
 
         for det in detections:
+            est_cm = getattr(det, "estimated_distance_cm", None)
             dv = _sample_depth(depth_map, det.center_x, det.center_y) \
                  if depth_map is not None else 1.0
-            colour = ((60,60,255) if dv <= ZONE_VERY_CLOSE
-                      else (40,160,255) if dv <= ZONE_CLOSE
-                      else (60,220,100))
+            if est_cm is not None:
+                colour = ((60,60,255) if est_cm <= 120
+                          else (40,160,255) if est_cm <= 220
+                          else (60,220,100))
+            else:
+                colour = ((60,60,255) if dv >= ZONE_VERY_CLOSE
+                          else (40,160,255) if dv >= ZONE_CLOSE
+                          else (60,220,100))
             cv2.rectangle(disp, (det.x1,det.y1), (det.x2,det.y2), colour, 2)
-            lbl = f"{det.class_name} {det.confidence:.0%}" + (
-                f" d={dv:.2f}" if depth_map is not None else "")
+            lbl = f"{det.class_name} {det.confidence:.0%}"
+            if est_cm is not None:
+                lbl += f" ~{est_cm:.0f}cm"
+            elif depth_map is not None:
+                lbl += f" rel={dv:.2f}"
             (tw,th),_ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
             cv2.rectangle(disp, (det.x1, det.y1-th-8),
                           (det.x1+tw+6, det.y1), colour, -1)
@@ -378,7 +387,7 @@ class AlertBadge(QLabel):
                            f"border-radius:14px;font:bold 11px Consolas;padding:0 12px;}}")
 
 class DetectionRow(QWidget):
-    def __init__(self, name, conf, depth):
+    def __init__(self, name, conf, distance_cm=None):
         super().__init__(); self.setFixedHeight(40)
         self.setStyleSheet(f"QWidget{{background:{P['bg_panel']};border:1px solid {P['border']};border-radius:6px;}}")
         lo = QHBoxLayout(self); lo.setContentsMargins(8,2,8,2); lo.setSpacing(8)
@@ -386,14 +395,21 @@ class DetectionRow(QWidget):
         nl.setStyleSheet(f"color:{P['hi']};background:transparent;border:none;"); nl.setFixedWidth(88); lo.addWidget(nl)
         cl = QLabel(f"{conf:.0%}"); cl.setFont(QFont("Consolas",9))
         cl.setStyleSheet(f"color:{P['mid']};background:transparent;border:none;"); cl.setFixedWidth(34); lo.addWidget(cl)
-        bar_col = P["danger"] if depth<=ZONE_VERY_CLOSE else P["warn"] if depth<=ZONE_CLOSE else P["accent2"]
-        bar = QProgressBar(); bar.setRange(0,100); bar.setValue(max(0,min(100,int((1-depth)*100))))
+        if distance_cm is not None:
+            bar_col = P["danger"] if distance_cm <= 120 else P["warn"] if distance_cm <= 220 else P["accent2"]
+            bar_val = max(0, min(100, int(100 - min(distance_cm, 400) / 4)))
+        else:
+            bar_col = P["lo"]
+            bar_val = 0
+        bar = QProgressBar(); bar.setRange(0,100); bar.setValue(bar_val)
         bar.setTextVisible(False); bar.setFixedHeight(8)
         bar.setStyleSheet(f"QProgressBar{{background:{P['bg_dark']};border:none;border-radius:4px;}}"
                           f"QProgressBar::chunk{{background:{bar_col};border-radius:4px;}}"); lo.addWidget(bar,1)
-        if depth < 1.0:
-            dl = QLabel(f"{depth:.2f}"); dl.setFont(QFont("Consolas",9))
-            dl.setStyleSheet(f"color:{bar_col};background:transparent;border:none;"); dl.setFixedWidth(32); lo.addWidget(dl)
+        dl = QLabel(f"{distance_cm:.0f}cm" if distance_cm is not None else "---")
+        dl.setFont(QFont("Consolas",9))
+        dl.setStyleSheet(f"color:{bar_col};background:transparent;border:none;")
+        dl.setFixedWidth(52)
+        lo.addWidget(dl)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -408,6 +424,8 @@ class VisionAssistApp(QMainWindow):
         self.resize(1380, 800)
         self._worker        = None
         self._asst_worker   = None
+        self._speech_worker = None
+        self._auto_listen_pending = False
         self._asst_history  = []          # conversation history for assistant
         self._last_dets     = []          # latest detections for assistant context
         self._last_dist_cm  = None        # latest ultrasonic reading
@@ -422,6 +440,9 @@ class VisionAssistApp(QMainWindow):
         self._setup_palette()
         self._build_ui()
         self._apply_style()
+        self._auto_listen_timer = QTimer(self)
+        self._auto_listen_timer.setSingleShot(True)
+        self._auto_listen_timer.timeout.connect(self._maybe_auto_listen)
 
     def _setup_palette(self):
         pal = QPalette()
@@ -600,10 +621,10 @@ class VisionAssistApp(QMainWindow):
         lo = QVBoxLayout(w); lo.setContentsMargins(8,8,8,8); lo.setSpacing(6)
 
         # API key row
-        key_card = _card("  ANTHROPIC API KEY")
+        key_card = _card("  GEMINI API KEY")
         klo = QVBoxLayout(key_card); klo.setContentsMargins(6,4,6,4)
         self.api_key_input = QLineEdit()
-        self.api_key_input.setPlaceholderText("sk-ant-api03-...")
+        self.api_key_input.setPlaceholderText("Gemini API key from Google AI Studio (optional if set in env)")
         self.api_key_input.setEchoMode(QLineEdit.Password)
         self.api_key_input.setFont(QFont("Consolas",9))
         self.api_key_input.setStyleSheet(
@@ -650,6 +671,15 @@ class VisionAssistApp(QMainWindow):
         self.chat_input.returnPressed.connect(self._send_question)
         ilo.addWidget(self.chat_input, 1)
 
+        self.listen_btn = QPushButton("MIC")
+        self.listen_btn.setFixedSize(56, 34); self.listen_btn.setFont(QFont("Consolas",9,QFont.Bold))
+        self.listen_btn.setStyleSheet(
+            f"QPushButton{{background:{P['accent']}22;color:{P['accent']};"
+            f"border:1px solid {P['accent']};border-radius:6px;}}"
+            f"QPushButton:hover{{background:{P['accent']}44;}}")
+        self.listen_btn.clicked.connect(self._listen_question)
+        ilo.addWidget(self.listen_btn)
+
         ask_btn = QPushButton("ASK")
         ask_btn.setFixedSize(54, 34); ask_btn.setFont(QFont("Consolas",10,QFont.Bold))
         ask_btn.setStyleSheet(
@@ -660,12 +690,25 @@ class VisionAssistApp(QMainWindow):
         ilo.addWidget(ask_btn)
         lo.addWidget(inp_row)
 
+        self.listen_status = QLabel("Press MIC and ask your question aloud.")
+        self.listen_status.setFont(QFont("Consolas",8))
+        self.listen_status.setWordWrap(True)
+        self.listen_status.setStyleSheet(f"color:{P['mid']};background:transparent;")
+        lo.addWidget(self.listen_status)
+
         # Speak response toggle
         self.speak_reply_chk = QCheckBox("Speak AI responses aloud")
         self.speak_reply_chk.setFont(QFont("Consolas",9))
         self.speak_reply_chk.setChecked(True)
         self.speak_reply_chk.setStyleSheet(f"color:{P['hi']};background:transparent;")
         lo.addWidget(self.speak_reply_chk)
+
+        self.handsfree_chk = QCheckBox("Hands-free follow-up mode")
+        self.handsfree_chk.setFont(QFont("Consolas",9))
+        self.handsfree_chk.setChecked(False)
+        self.handsfree_chk.setStyleSheet(f"color:{P['hi']};background:transparent;")
+        self.handsfree_chk.stateChanged.connect(self._on_handsfree_changed)
+        lo.addWidget(self.handsfree_chk)
 
         clr_btn = QPushButton("Clear conversation")
         clr_btn.setFont(QFont("Consolas",8)); clr_btn.setFixedHeight(24)
@@ -865,6 +908,9 @@ class VisionAssistApp(QMainWindow):
         self._reset()
 
     def _reset(self):
+        self._auto_listen_pending = False
+        if hasattr(self, "_auto_listen_timer"):
+            self._auto_listen_timer.stop()
         self.start_btn.setText("▶  START")
         self.start_btn.setStyleSheet(self._btn(P["accent2"], running=False))
         self.mode_combo.setEnabled(True)
@@ -967,19 +1013,18 @@ class VisionAssistApp(QMainWindow):
     # ════════════════════════════════════════════════════════════════
     # AI ASSISTANT
     # ════════════════════════════════════════════════════════════════
-    def _send_question(self):
-        question = self.chat_input.text().strip()
+    def _send_question(self, question_text=None):
+        question = (question_text if question_text is not None else self.chat_input.text()).strip()
         if not question:
             return
 
         api_key = self.api_key_input.text().strip()
-        if not api_key:
-            self.chat_log.append(
-                f'<span style="color:{P["danger"]}"><b>⚠ Enter your Anthropic API key in the field above.</b></span>')
-            return
 
         if self._asst_worker and self._asst_worker.isRunning():
             return  # still processing previous question
+
+        self._auto_listen_pending = False
+        self.listen_status.setText("Processing your question…")
 
         # Show user message
         self.chat_log.append(
@@ -1004,6 +1049,44 @@ class VisionAssistApp(QMainWindow):
         self._asst_worker.error_occurred.connect(self._on_asst_error)
         self._asst_worker.start()
 
+    def _listen_question(self):
+        if self._speech_worker and self._speech_worker.isRunning():
+            return
+        if self._asst_worker and self._asst_worker.isRunning():
+            self.listen_status.setText("Please wait for the current assistant response to finish.")
+            return
+
+        self._auto_listen_pending = False
+        self.listen_btn.setEnabled(False)
+        self.listen_btn.setText("...")
+        self.listen_status.setText("Listening for your question… speak now.")
+
+        self._speech_worker = SpeechInputWorker(timeout_sec=6)
+        self._speech_worker.transcript_ready.connect(self._on_speech_question)
+        self._speech_worker.error_occurred.connect(self._on_speech_error)
+        self._speech_worker.finished.connect(self._on_speech_finished)
+        self._speech_worker.start()
+
+    def _on_speech_question(self, transcript):
+        transcript = transcript.strip()
+        if not transcript:
+            self.listen_status.setText("No speech was detected. Please try again.")
+            return
+
+        self.chat_input.setText(transcript)
+        self.listen_status.setText(f'Heard: "{transcript}"')
+        self._send_question(transcript)
+
+    def _on_speech_error(self, err):
+        self.listen_status.setText(f"Microphone error: {err}")
+        if self.handsfree_chk.isChecked():
+            self._schedule_auto_listen(1800)
+
+    def _on_speech_finished(self):
+        self.listen_btn.setEnabled(True)
+        self.listen_btn.setText("MIC")
+        self._speech_worker = None
+
     def _on_asst_response(self, question, answer):
         # Remove "thinking…" line
         cursor = self.chat_log.textCursor()
@@ -1021,6 +1104,7 @@ class VisionAssistApp(QMainWindow):
         self._asst_history.append({"role":"assistant", "content": answer})
         if len(self._asst_history) > 20:
             self._asst_history = self._asst_history[-20:]
+        self.listen_status.setText("Ready. Press MIC to ask another question.")
 
         # Speak if requested and worker voice is available
         if self.speak_reply_chk.isChecked() and self._worker and self._worker.voice:
@@ -1030,11 +1114,56 @@ class VisionAssistApp(QMainWindow):
             except Exception:
                 pass
 
+        self._schedule_auto_listen(self._auto_listen_delay_ms(answer))
+
     def _on_asst_error(self, err):
         self.chat_log.append(
             f'<span style="color:{P["danger"]}"><b>Error:</b></span> '
             f'<span style="color:{P["warn"]}">{err}</span>')
         sb = self.chat_log.verticalScrollBar(); sb.setValue(sb.maximum())
+        self.listen_status.setText(f"Assistant error: {err}")
+        self._schedule_auto_listen(2200)
+
+    def _on_handsfree_changed(self, state):
+        enabled = bool(state)
+        if enabled:
+            self.listen_status.setText("Hands-free mode on. The assistant will listen again after each reply.")
+            self._schedule_auto_listen(1200)
+        else:
+            self._auto_listen_pending = False
+            self.listen_status.setText("Hands-free mode off. Press MIC when you want to ask by voice.")
+
+    def _auto_listen_delay_ms(self, answer: str) -> int:
+        if not answer:
+            return 1800
+        word_count = max(1, len(answer.split()))
+        base_ms = 1200
+        if self.speak_reply_chk.isChecked():
+            speak_ms = int((word_count / 2.6) * 1000) + 1800
+            return max(base_ms, min(12000, speak_ms))
+        return base_ms
+
+    def _schedule_auto_listen(self, delay_ms: int):
+        if not self.handsfree_chk.isChecked():
+            return
+        if self._speech_worker and self._speech_worker.isRunning():
+            return
+        if self._asst_worker and self._asst_worker.isRunning():
+            self._auto_listen_pending = True
+            return
+        self._auto_listen_pending = True
+        self._auto_listen_timer.start(max(400, int(delay_ms)))
+
+    def _maybe_auto_listen(self):
+        if not self.handsfree_chk.isChecked() or not self._auto_listen_pending:
+            return
+        if self._speech_worker and self._speech_worker.isRunning():
+            return
+        if self._asst_worker and self._asst_worker.isRunning():
+            self._schedule_auto_listen(1000)
+            return
+        self._auto_listen_pending = False
+        self._listen_question()
 
     # ════════════════════════════════════════════════════════════════
     # DETECTION ROWS
@@ -1056,10 +1185,14 @@ class VisionAssistApp(QMainWindow):
             ph.setFont(QFont("Consolas",9)); ph.setStyleSheet(f"color:{P['lo']};background:transparent;border:none;")
             self._dr_lo.addWidget(ph); self.obj_cnt.setText("0 objects in frame")
             self.badge.set_urgency("none"); self.alert_msg.setText(""); return
-        adv_depth = advice.depth_value if advice else 0.9
         for det in detections[:8]:
-            depth = adv_depth if (advice and advice.object_name==det.class_name) else 0.9
-            self._dr_lo.addWidget(DetectionRow(det.class_name, det.confidence, depth))
+            self._dr_lo.addWidget(
+                DetectionRow(
+                    det.class_name,
+                    det.confidence,
+                    getattr(det, "estimated_distance_cm", None),
+                )
+            )
         n = len(detections)
         self.obj_cnt.setText(f"{n} object{'s' if n!=1 else ''} in frame")
 

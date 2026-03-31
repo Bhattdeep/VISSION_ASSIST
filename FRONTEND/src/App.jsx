@@ -126,12 +126,12 @@ export default function App() {
     send({ type: 'depth_overlay', enabled: val })
   }
 
-  const handleAsk = (question, apiKey) => {
+  const handleAsk = useCallback((question, apiKey) => {
     setChatMsgs((p) => [...p, { role: 'user', text: question }])
     setAiBusy(true)
     send({ type: 'ask', question, api_key: apiKey })
     setActiveTab('assist')
-  }
+  }, [send])
 
   // ── Right panel content ───────────────────────────────────────────
   const renderPanel = () => {

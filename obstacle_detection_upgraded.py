@@ -36,6 +36,7 @@ from detection  import ObjectDetector
 from depth      import DepthEstimator
 from navigation import Navigator, ZONE_VERY_CLOSE, ZONE_CLOSE
 from voice      import VoiceEngine, PRIORITY_CRITICAL, PRIORITY_WARNING, PRIORITY_INFO
+from alerts     import AlertSuppressor
 
 
 # ─────────────────────────────────────────────
@@ -64,18 +65,28 @@ def draw_detections(frame, detections, depth_map):
     """Draw bounding boxes annotated with class, confidence and depth."""
     for det in detections:
         # Box colour based on depth
+        est_cm = getattr(det, "estimated_distance_cm", None)
         depth_val = 1.0
         if depth_map is not None:
             from navigation import Navigator as _Nav
             depth_val = _Nav._sample_depth(depth_map, det.center_x, det.center_y)
 
-        if   depth_val <= ZONE_VERY_CLOSE:  colour = (0,   0, 255)   # red   — very close
-        elif depth_val <= ZONE_CLOSE:       colour = (0, 165, 255)   # orange — close
-        else:                               colour = (0, 255,   0)   # green  — far
+        if est_cm is not None:
+            if   est_cm <= 120:  colour = (0,   0, 255)
+            elif est_cm <= 220:  colour = (0, 165, 255)
+            else:                colour = (0, 255,   0)
+        else:
+            if   depth_val >= ZONE_VERY_CLOSE:  colour = (0,   0, 255)
+            elif depth_val >= ZONE_CLOSE:       colour = (0, 165, 255)
+            else:                               colour = (0, 255,   0)
 
         cv2.rectangle(frame, (det.x1, det.y1), (det.x2, det.y2), colour, 2)
 
-        label = f"{det.class_name}  {det.confidence:.0%}  d={depth_val:.2f}"
+        label = f"{det.class_name}  {det.confidence:.0%}"
+        if est_cm is not None:
+            label += f"  ~{est_cm:.0f}cm"
+        else:
+            label += f"  rel={depth_val:.2f}"
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.50, 1)
         cv2.rectangle(
             frame,
@@ -154,6 +165,7 @@ def main():
     detector  = ObjectDetector(model_path=MODEL_PATH, confidence=CONFIDENCE)
     depth_est = DepthEstimator(frame_skip=FRAME_SKIP)
     navigator = Navigator(frame_width=FRAME_WIDTH, frame_height=FRAME_HEIGHT)
+    alert_guard = AlertSuppressor(min_repeat_gap_sec=max(6.0, ALERT_DELAY * 3.0))
 
     last_alert_time = 0.0
     show_depth      = False
@@ -181,7 +193,16 @@ def main():
 
         # ── Voice alert ─────────────────────
         current_time = time.time()
-        if advice and (current_time - last_alert_time) > ALERT_DELAY:
+        if (
+            advice
+            and (current_time - last_alert_time) > ALERT_DELAY
+            and alert_guard.should_emit(
+                advice.fingerprint,
+                advice.urgency,
+                advice.distance_cm,
+                current_time,
+            )
+        ):
             priority_map = {
                 "critical": PRIORITY_CRITICAL,
                 "warning" : PRIORITY_WARNING,

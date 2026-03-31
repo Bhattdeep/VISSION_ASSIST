@@ -8,7 +8,7 @@ of gui.py does NOT trigger DLL loading on Windows.
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import List, Any
+from typing import List, Any, Optional
 
 
 # ------------------------------------------------------------------ #
@@ -27,11 +27,18 @@ class Detection:
     center_x   : int = field(init=False)
     center_y   : int = field(init=False)
     area       : int = field(init=False)
+    bbox_width : int = field(init=False)
+    bbox_height: int = field(init=False)
+    estimated_distance_cm: Optional[float] = None
+    h_position : Optional[str] = None
+    urgency    : Optional[str] = None
 
     def __post_init__(self):
+        self.bbox_width = max(0, self.x2 - self.x1)
+        self.bbox_height = max(0, self.y2 - self.y1)
         self.center_x = (self.x1 + self.x2) // 2
         self.center_y = (self.y1 + self.y2) // 2
-        self.area     = (self.x2 - self.x1) * (self.y2 - self.y1)
+        self.area     = self.bbox_width * self.bbox_height
 
 
 # ------------------------------------------------------------------ #
